@@ -32,29 +32,36 @@ def append_inference_to_yaml(filepath, mcmc_params, results=None):
     filepath : str
         Path to an existing YAML file created from disk/chemistry/observation params.
     mcmc_params : dict
-        Dictionary of inference parameters, e.g. {
-            "method": "emcee",
-            "numpy_seed": ...,
-            "nwalkers": ...,
-            "nburn": ...,
-            "nsteps": ...,
-            "sampled_params": ["v_turb"],
-            "bounds": {"v_turb": [.., ..]}
-        }
+        Dictionary of inference parameters.
+        Example::
+
+            {
+                "method": "emcee",
+                "numpy_seed": 123,
+                "nwalkers": 64,
+                "nburn": 2_000,
+                "nsteps": 10_000,
+                "sampled_params": ["v_turb"],
+                "bounds": {"v_turb": [1e-3, 1e-1]}
+            }
+
     results : dict, optional
-        Dictionary of results to store, e.g. {
-            "v_turb_true": ..,
-            "v_turb_map": ..,
-            "v_turb_med": ..,
-            "v_turb_ci68": [.., ..],
-            "rms_map": ..
-        }
+        Dictionary of results to store.
+        Example::
+
+            {
+                "v_turb_true": 0.01,
+                "v_turb_map": 0.012,
+                "v_turb_med": 0.011,
+                "v_turb_ci68": [0.009, 0.013],
+                "rms_map": 3.4e-3
+            }
 
     Returns
     -------
     dict
         The merged YAML dictionary (with safe types).
-    """   
+    """
     # Load existing YAML
     try:
         with open(filepath, "r") as f:

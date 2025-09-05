@@ -24,7 +24,7 @@ Conventions
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -102,13 +102,16 @@ def load_molecular_tables(chem_params: "ChemistryParams") -> MolecularData:
     -----
     See e.g. tables below from molecule_12c16o.inp
     CO Molecular tables can be found here: https://home.strw.leidenuniv.nl/~moldata/CO.html
-    ------------------------------------
-    LEVEL   ENERGIES(cm^-1)   WEIGHT     J
-      3     11.534919938	    5.0	     2
-      4     23.069512649	    7.0	     3
-    ---------------------------------------------------------
-    TRANS   UP   LOW  EINSTEINA(s^-1)  FREQ(GHz)       E_u(K)
-      3     4     3   2.497e-06        345.7959899     33.19
+ 
+     ::
+     
+        ------------------------------------
+        LEVEL   ENERGIES(cm^-1)   WEIGHT     J
+          3     11.534919938	    5.0	     2
+          4     23.069512649	    7.0	     3
+        ---------------------------------------------------------
+        TRANS   UP   LOW  EINSTEINA(s^-1)  FREQ(GHz)       E_u(K)
+          3     4     3   2.497e-06        345.7959899     33.19
     """
     relpath = chem_params.molecular_table
 

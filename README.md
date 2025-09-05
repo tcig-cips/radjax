@@ -1,4 +1,4 @@
-# radjax
+# RadJAX
 A `JAX` based line radiative transfer code for inference of protoplanetary disks.  
 JAX-based array operations produce significant speedups, enabling fast computations of line-rte. 
 

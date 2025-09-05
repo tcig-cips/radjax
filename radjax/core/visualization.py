@@ -17,6 +17,9 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
+from pathlib import Path
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation
@@ -476,6 +479,183 @@ def slider_frame_comparison(
 # ----------------------------------------------------------------------------- #
 # Animation
 # ----------------------------------------------------------------------------- #
+from pathlib import Path
+
+def animate_frame_comparison(
+    frames1: np.ndarray,
+    frames2: np.ndarray,
+    axis: int = 0,
+    scale: str = "amp",
+    title1: Optional[str] = None,
+    title2: Optional[str] = None,
+    cmap12: str = "inferno",
+    cmap_diff: str = "RdBu_r",
+    *,
+    fps: int = 10,
+    output: Optional[str] = None,
+    writer: str = "ffmpeg",
+    dpi: int = 120,
+    bitrate: int = 1_000_000,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    diff_vmin: Optional[float] = None,
+    diff_vmax: Optional[float] = None,
+    global_percentiles: Tuple[float, float] = (1, 99),
+    diff_percentiles: Tuple[float, float] = (2, 98),
+    dynamic_clim: bool = False,
+    max_frames: Optional[int] = None,
+) -> Tuple[animation.FuncAnimation, Optional[str]]:
+    """
+    Animate a side-by-side comparison of two 3D stacks, plus a difference panel.
+
+    Parameters
+    ----------
+    frames1, frames2 : np.ndarray
+        3D arrays with matching size along `axis`.
+    axis : int
+        Frame axis.
+    scale : {'amp', 'log'}
+        'amp': third panel shows absolute difference |f1 - f2|.
+        'log': third panel shows log(|f1/f2|) with a small epsilon for stability.
+    title1, title2 : str or None
+        Titles for the first and second panels.
+    cmap12 : str
+        Colormap for panels 1–2 (default "inferno").
+    cmap_diff : str
+        Colormap for the difference/log-ratio panel (default "RdBu_r").
+    fps : int
+        Frames per second.
+    output : str, optional
+        Save animation if provided (supports .mp4 or .gif).
+    writer : str
+        Matplotlib writer for mp4 (default: 'ffmpeg').
+    dpi : int
+        Output DPI.
+    bitrate : int
+        Bitrate for mp4 output.
+    vmin, vmax : float, optional
+        Manual limits for the first two panels. Overrides global_percentiles if set.
+    diff_vmin, diff_vmax : float, optional
+        Manual limits for the difference panel. Overrides diff_percentiles if set.
+    global_percentiles : tuple(float, float)
+        Percentiles for vmin/vmax if not set manually (default=(1,99)).
+    diff_percentiles : tuple(float, float)
+        Percentiles for difference panel scaling (default=(2,98)).
+    dynamic_clim : bool
+        If True, rescale limits each frame.
+    max_frames : int or None
+        Limit number of frames to animate.
+
+    Returns
+    -------
+    anim : matplotlib.animation.FuncAnimation
+    saved_path : str or None
+        Path where the animation was saved.
+    """
+    f1 = np.asarray(frames1)
+    f2 = np.asarray(frames2)
+    if f1.ndim != 3 or f2.ndim != 3:
+        raise ValueError("Both inputs must be 3D arrays.")
+    if f1.shape[axis] != f2.shape[axis]:
+        raise ValueError("Frame dimension sizes must match.")
+    if scale not in {"amp", "log"}:
+        raise ValueError("scale must be 'amp' or 'log'.")
+
+    # Move frame axis to 0
+    def move_t0(a: np.ndarray): return np.moveaxis(a, axis, 0)
+    f1 = move_t0(f1)
+    f2 = move_t0(f2)
+    T = f1.shape[0]
+    if max_frames is not None:
+        T = min(T, int(max_frames))
+        f1 = f1[:T]
+        f2 = f2[:T]
+
+    eps = 1e-20
+
+    # Scaling for panels 1 & 2
+    if vmin is None or vmax is None:
+        combined = np.concatenate([f1, f2], axis=0)
+        vmin_auto, vmax_auto = np.nanpercentile(combined, global_percentiles)
+        vmin = vmin if vmin is not None else vmin_auto
+        vmax = vmax if vmax is not None else vmax_auto
+
+    # Scaling for diff/log panel
+    if scale == "amp":
+        diff_data = np.abs(f1 - f2)
+    else:
+        diff_data = np.log(np.abs((f1 + eps) / (f2 + eps)))
+    if diff_vmin is None or diff_vmax is None:
+        dmin_auto, dmax_auto = np.nanpercentile(diff_data, diff_percentiles)
+        diff_vmin = diff_vmin if diff_vmin is not None else dmin_auto
+        diff_vmax = diff_vmax if diff_vmax is not None else dmax_auto
+
+    # Set up figure
+    fig, axes = plt.subplots(1, 3, figsize=(10, 3), constrained_layout=True)
+    titles = [
+        title1,
+        title2,
+        "Absolute difference" if scale == "amp" else "Log relative difference",
+    ]
+    cmaps = [cmap12, cmap12, cmap_diff]
+
+    # Initial frame
+    def get_triplet(k: int):
+        a = f1[k]
+        b = f2[k]
+        if scale == "amp":
+            c = np.abs(a - b)
+        else:
+            c = np.log(np.abs((a + eps) / (b + eps)))
+        return a, b, c
+
+    a0, b0, c0 = get_triplet(0)
+    ims, cbars = [], []
+    for ax, img0, title, cmap, vmin_i, vmax_i in zip(
+        axes, [a0, b0, c0], titles, cmaps,
+        [vmin, vmin, diff_vmin], [vmax, vmax, diff_vmax]
+    ):
+        im = ax.imshow(img0, origin="lower", cmap=cmap, vmin=vmin_i, vmax=vmax_i)
+        ax.set_title(title)
+        ax.set_xticks([]); ax.set_yticks([])
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        cbars.append(fig.colorbar(im, cax=cax))
+        ims.append(im)
+    def update(k: int):
+        a, b, c = get_triplet(k)
+        for im, arr in zip(ims, [a, b, c]):
+            im.set_data(arr)
+        if dynamic_clim:
+            ims[0].set_clim(np.nanmin(a), np.nanmax(a))
+            ims[1].set_clim(np.nanmin(b), np.nanmax(b))
+            ims[2].set_clim(np.nanmin(c), np.nanmax(c))
+            for im, cb in zip(ims, cbars):
+                cb.mappable.set_clim(im.get_clim())
+        fig.suptitle(f"Frame {k+1}/{f1.shape[0]}", fontsize=10)
+        return ims
+
+    anim = animation.FuncAnimation(fig, update, frames=f1.shape[0], interval=1000 / fps)
+
+    saved = None
+    if output:
+        out_dir = Path(output).parent
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            if output.lower().endswith(".gif"):
+                from matplotlib.animation import PillowWriter
+                anim.save(output, writer=PillowWriter(fps=fps), dpi=dpi)
+            elif output.lower().endswith(".mp4"):
+                from matplotlib.animation import FFMpegWriter
+                anim.save(output, writer=FFMpegWriter(fps=fps, bitrate=bitrate), dpi=dpi)
+            else:
+                raise ValueError("Unsupported extension. Use .mp4 or .gif")
+            saved = output
+        except Exception as e:
+            print(f"[animate_frame_comparison] Failed to save to {output}: {e}")
+
+    return anim, saved
+
 def animate_movies_synced(
     movie_list: Sequence[np.ndarray],
     axes: Sequence[plt.Axes],

@@ -11,8 +11,11 @@ This module wraps a FITS spectral cube (via `imagecube`) and derives:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Union, TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from .sensor import ObservationParams  # only for type checking / docs
+    
 import numpy as np
 import jax.numpy as jnp
 
@@ -38,7 +41,7 @@ class PreparedALMACube:
 
 def prepare_alma_cube(
     data_path: str,
-    metadata: "ALMASensorMetadata",
+    obs_params: "ObservationParams",
     *,
     to_jax: bool = True,
     imagecube_kwargs: Optional[dict] = None,
@@ -50,7 +53,7 @@ def prepare_alma_cube(
     ----------
     data_path : str
         Path to the FITS cube.
-    metadata : ALMASensorMetadata
+    obs_params : ObservationParams
         Includes fov_as (arcsec), velocity_range (m/s), vlsr (m/s).
     to_jax : bool, default True
         Return JAX arrays for numeric outputs when True; NumPy otherwise.
@@ -62,14 +65,14 @@ def prepare_alma_cube(
     PreparedALMACube
     """
 
-    ic_kwargs = dict(FOV=getattr(metadata, "fov", None), velocity_range=getattr(metadata, "velocity_range"))
+    ic_kwargs = dict(FOV=getattr(obs_params, "fov", None), velocity_range=getattr(obs_params, "velocity_range"))
     if imagecube_kwargs:
         ic_kwargs.update(imagecube_kwargs)
 
     cube = imagecube(data_path, **ic_kwargs)
 
     # spectra & axes
-    freqs = cube.velocity_to_restframe_frequency(vlsr=getattr(metadata, "vlsr"))
+    freqs = cube.velocity_to_restframe_frequency(vlsr=getattr(obs_params, "vlsr"))
     velocities = cube.velax     # m/s
     data = cube.data            # (nchan, ny, nx)
     xaxis = cube.xaxis          # arcsec
