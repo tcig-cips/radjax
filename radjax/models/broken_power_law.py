@@ -24,6 +24,7 @@ import yaml
 # local constants
 from ..core.consts import M_sun, au, m_mol_h
 from ..core import phys
+from ..core import grid
 from ..core import sensor
 from ..core import chemistry as chem
 
@@ -363,57 +364,82 @@ def temperature_profile(z: jnp.ndarray, r: jnp.ndarray, params: DiskParams) -> j
         T_atm,
     )
 
-def forward_model(    
+def forward_model_with_rays(    
     *,
     disk_params: DiskParams, 
-    freqs: jnp.ndarray,           # (F,)
-    state: SamplerState,
+    chem_params: ChemistryParams,
+    mol: MolecularData,
+    rays: RayBundle ,     
+    freqs: jnp.ndarray,       
+    beam_kernel: Optional[jnp.ndarray] = None,
     output: Literal["image","vis"] = "image",
     backend: Literal["vmap","pmap","none"] = "vmap",
+    use_pressure_correction: bool = True,
 ):
     """
-    Forward-model a spectral cube from disk parameters. If a 2D beam kernel is present
-    at `state.beam.kernel`, convolve each channel; otherwise return the raw images.
-    Visibility sampling is a placeholder.
+    Forward-model a spectral cube from parametric disk parameters using a
+    preconstructed RayBundle. This is the fastest inference mode, since the
+    ray geometry does not change between evaluations.
 
     Parameters
     ----------
     disk_params : DiskParams
-        Current disk parameter set (updated from θ via adapter).
-    freqs : (F,) jnp.ndarray
-        Frequency grid [Hz] at which to compute the cube.
-    state : SamplerState
-        Immutable context (rays, molecule, chemistry, etc.). May include an optional
-        2D beam kernel at `state.beam.kernel` with shape (ny, nx).
+        Parametric disk parameters for the current model evaluation.
+    chem_params : ChemistryParams
+        Chemistry thresholds and tracer abundance settings.
+    mol : MolecularData
+        Molecular line data (energy levels, transitions, Einstein coefficients).
+    rays : RayBundle
+        Prebuilt camera rays describing the projection geometry.
+    freqs : jnp.ndarray of shape (F,)
+        Frequency grid in Hz at which to compute the spectral cube.
+    beam_kernel : jnp.ndarray of shape (ny, nx), optional
+        2D beam kernel. If provided, each frequency channel is convolved with it.
+        If ``None`` (default), raw model images are returned.
     output : {"image", "vis"}, default="image"
-        "image": return (optionally beam-convolved) image cube.
-        "vis":   not implemented yet (raises).
-    backend : {"vmap","pmap","none"}, default="vmap"
-        Compute backend for the radiative transfer solver.
+        Select output mode:
+          * ``"image"`` – return spectral cube (optionally beam-convolved).
+          * ``"vis"`` – placeholder, not implemented.
+    backend : {"vmap", "pmap", "none"}, default="vmap"
+        Backend for the radiative transfer solver:
+          * ``"vmap"`` – vectorized over frequency (fastest single-device).
+          * ``"pmap"`` – parallelize across devices (multi-GPU/TPU).
+          * ``"none"`` – plain Python loop (slowest, debugging only).
+    use_pressure_correction : bool, default=True
+        If True, include pressure support in azimuthal velocity.
 
     Returns
     -------
     jnp.ndarray
-        If output="image": (F, ny, nx) spectral cube (beam-convolved if beam exists).
-        If output="vis": raises NotImplementedError.
+        Spectral cube with shape (F, ny, nx).
+        If ``output="image"``: returns beam-convolved cube if a kernel is provided,
+        else raw cube.
+        If ``output="vis"``: raises ``NotImplementedError``.
 
     Raises
     ------
     NotImplementedError
-        If `output="vis"`.
+        If ``output="vis"`` is selected (visibility sampling not implemented).
     ValueError
-        If `output` is not one of {"image","vis"}.
+        If ``output`` is not one of {"image", "vis"}.
+
+    Notes
+    -----
+    For MCMC, use this function when the ray geometry is fixed, i.e. inclination,
+    position angle, and related viewing parameters are *not* part of the parameter
+    vector ``θ``. If geometry is variable, use
+    :func:`forward_model_rotate_rays` instead.
     """
     # 1) Disk fields on (z,r) grid
     temperature, v_phi, co_nd, base_disk = co_disk_from_params(
         disk_params=disk_params,
-        chem_params=state.chem_params,
-        pressure_correction=getattr(state, "use_pressure_correction", True),
+        chem_params=chem_params,
+        pressure_correction=use_pressure_correction,
     )
 
     # 2) Sample fields along rays
     nd_ray, temperature_ray, velocity_ray = sensor.sample_symmetric_disk__along_rays(
-        rays=state.rays,
+        rays=rays,
         bbox=base_disk.bbox,
         co_nd=co_nd,
         temperature=temperature,
@@ -422,20 +448,19 @@ def forward_model(
 
     # 3) Radiative transfer -> raw cube
     images = sensor.render_cube(
-        rays=state.rays,
+        rays=rays,
         nd_ray=nd_ray,
         temperature_ray=temperature_ray,
         velocity_ray=velocity_ray,
-        nu0=state.mol.nu0,
+        nu0=mol.nu0,
         freqs=freqs,
         v_turb=disk_params.v_turb,
-        mol=state.mol,
+        mol=mol,
         backend=backend,
     )
 
     # 4) Post-processing
     if output == "image":
-        beam_kernel = getattr(getattr(state, "beam", None), "kernel", None)
         return sensor.fftconvolve_vmap(images, beam_kernel) if beam_kernel is not None else images
 
     if output == "vis":
@@ -445,18 +470,102 @@ def forward_model(
         )
 
     raise ValueError("output must be 'image' or 'vis'")
-    
 
-# Pre-jitted functions
-temperature_profile_jit = jax.jit(temperature_profile)
-co_disk_from_params_jit = jax.jit(co_disk_from_params, static_argnames=("pressure_correction",))
-forward_model_jit = jax.jit(
-    lambda disk_params, freqs, state: forward_model(
+
+def forward_model_rotate_rays(
+    *,
+    disk_params: DiskParams,
+    chem_params: ChemistryParams,
+    mol: MolecularData,
+    rays_base: RayBundle,
+    incl_deg: float,
+    phi_deg: float,
+    posang_deg: float,
+    freqs: jnp.ndarray,
+    beam_kernel: Optional[jnp.ndarray] = None,
+    output: Literal["image","vis"] = "image",
+    backend: Literal["vmap","pmap","none"] = "vmap",
+    use_pressure_correction: bool = True,
+) -> jnp.ndarray:
+    """
+    Forward-model a spectral cube from parametric disk parameters by rotating
+    a canonical RayBundle according to new viewing angles
+    (inclination, azimuthal rotation, and position angle).
+
+    This mode is intended for inference when geometric parameters (e.g.
+    inclination, position angle) are part of the sampled parameter vector ``θ``.
+
+    Parameters
+    ----------
+    disk_params : DiskParams
+        Parametric disk parameters for the current model evaluation.
+    chem_params : ChemistryParams
+        Chemistry thresholds and tracer abundance settings.
+    mol : MolecularData
+        Molecular line data (energy levels, transitions, Einstein coefficients).
+    rays_base : RayBundle
+        Canonical camera rays built once at reference geometry (e.g. zero inclination).
+        Geometry is updated each call by rotation, avoiding a full ray rebuild.
+    incl_deg : float
+        Inclination angle in degrees.
+    phi_deg : float
+        Azimuthal rotation angle in degrees.
+    posang_deg : float
+        Position angle (roll about line of sight) in degrees.
+    freqs : jnp.ndarray of shape (F,)
+        Frequency grid in Hz at which to compute the spectral cube.
+    beam_kernel : jnp.ndarray of shape (ny, nx), optional
+        2D beam kernel. If provided, each frequency channel is convolved with it.
+        If ``None`` (default), raw model images are returned.
+    output : {"image", "vis"}, default="image"
+        Select output mode:
+          * ``"image"`` – return spectral cube (optionally beam-convolved).
+          * ``"vis"`` – placeholder, not implemented.
+    backend : {"vmap", "pmap", "none"}, default="vmap"
+        Backend for the radiative transfer solver:
+          * ``"vmap"`` – vectorized over frequency (fastest single-device).
+          * ``"pmap"`` – parallelize across devices (multi-GPU/TPU).
+          * ``"none"`` – plain Python loop (slowest, debugging only).
+    use_pressure_correction : bool, default=True
+        If True, include pressure support in azimuthal velocity.
+
+    Returns
+    -------
+    jnp.ndarray
+        Spectral cube with shape (F, ny, nx).
+        If ``output="image"``: returns beam-convolved cube if a kernel is provided,
+        else raw cube.
+        If ``output="vis"``: raises ``NotImplementedError``.
+
+    Raises
+    ------
+    NotImplementedError
+        If ``output="vis"`` is selected (visibility sampling not implemented).
+    ValueError
+        If ``output`` is not one of {"image", "vis"}.
+
+    Notes
+    -----
+    For MCMC, use this function when the geometry (inclination, position angle)
+    is included in the parameter vector ``θ``. This avoids recomputing the full
+    ray grid (distance, FOV, z_width) and only rotates a precomputed canonical
+    RayBundle. If camera scale parameters also vary, a full ray rebuild is required
+    (see :func:`sensor.rays_from_params`).
+    """
+    rays = grid.rotate_rays(
+        rays_base,
+        incl_deg=incl_deg,
+        phi_deg=phi_deg,
+        posang_deg=posang_deg,
+    )
+    return forward_model_with_rays(
         disk_params=disk_params,
+        chem_params=chem_params,
+        mol=mol,
+        rays=rays,
         freqs=freqs,
-        state=state,
-        output="image",     # baked in
-        backend="vmap",     # baked in
-    ),
-    static_argnames=(),  # nothing dynamic except the baked-in flags
-)
+        beam_kernel=beam_kernel,
+        output=output,
+        backend=backend,
+        use_pressure_correction=use_pressure_correction,
+    )

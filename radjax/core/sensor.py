@@ -200,7 +200,7 @@ def rays_alma_projection(
     # stack (ny*nx, 3), align to world; roll by -posang about LOS
     ray_dir = jnp.stack((ray_y_dir, ray_x_dir, ray_z_dir), axis=-1).reshape(ny * nx, 3)
     ray_dir = grid.rotate_coords_angles(ray_dir, incl, -phi)
-    ray_dir = grid. rotate_coords_vector(ray_dir, obs_dir, -posang)
+    ray_dir = grid.rotate_coords_vector(ray_dir, obs_dir, -posang)
 
     # ---- intersections with z = ± z_width/2 (world coords in cm)
     d_cm     = distance * pc
@@ -250,6 +250,59 @@ def rays_from_params(
         float(obs_params.fov),
     )
 
+def rotate_rays(
+    rays_base: RayBundle,
+    *,
+    incl_deg: float,
+    phi_deg: float,
+    posang_deg: float,
+):
+    """
+    Rotate a canonical RayBundle by new viewing angles without changing the
+    underlying sampling (FOV, distance, ``nray``, or ``z_width``).
+
+    Parameters
+    ----------
+    rays_base : RayBundle
+        Canonical ray bundle constructed at reference geometry (e.g. zero inclination).
+    incl_deg : float
+        Inclination angle in degrees.
+    phi_deg : float
+        Azimuthal rotation angle in degrees.
+    posang_deg : float
+        Position angle (roll about the line of sight) in degrees.
+
+    Returns
+    -------
+    RayBundle
+        A new RayBundle with identical shape and pixel area as ``rays_base``,
+        but with rotated coordinates and updated line-of-sight direction.
+
+    Notes
+    -----
+    - The base coordinates are assumed to be in world space for some reference
+      angles.
+    - Rotations follow the same convention as :func:`rays_alma_projection`:
+      
+      * ``obs_dir = rotate([0,0,1], incl, phi)``  
+      * ``coords  = rotate(coords, incl, -phi)``  
+      * ``coords  = rotate_about(obs_dir, coords, -posang)``  
+
+    Use this when inclination or position angle are part of the parameter
+    vector ``θ``, but the overall camera grid (distance, FOV, ``nray``, ``z_width``)
+    remains fixed.
+    """
+    # LOS after (incl, phi)
+    obs_dir = jnp.squeeze(grid.rotate_coords_angles(jnp.array([0.0, 0.0, 1.0]), incl_deg, phi_deg))  # (3,)
+
+    # Rotate coordinates
+    coords = rays_base.coords_xyz.reshape(-1, 3)
+    coords = grid.rotate_coords_angles(coords, incl_deg, -phi_deg)
+    coords = grid.rotate_coords_vector(coords, obs_dir, -posang_deg)
+    coords = coords.reshape(rays_base.coords_xyz.shape)
+
+    # Rebuild RayBundle (keep nx, ny, nray, pixel_area; update coords & obs_dir)
+    return rays_base.replace(coords_xyz=coords, obs_dir=obs_dir)
 
 def params_from_yaml(filename: str | Path) -> ObservationParams:
     """
